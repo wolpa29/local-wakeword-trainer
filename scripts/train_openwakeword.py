@@ -9,6 +9,7 @@ import scipy.io.wavfile
 import torch
 from tqdm import tqdm
 
+from openwakeword.model import Model as WakewordModel
 from openwakeword.data import augment_clips, mmap_batch_generator
 from openwakeword.train import Model, convert_onnx_to_tflite
 from openwakeword.utils import AudioFeatures, compute_features_from_generator, download_models
@@ -25,20 +26,32 @@ ARTIFACT_DIR = PROJECT_ROOT / "artifacts"
 FEATURE_DIR = ARTIFACT_DIR / "features"
 MODEL_DIR = PROJECT_ROOT / "models"
 
+# Name used for the exported files: models/homie.onnx and models/homie.tflite.
 MODEL_NAME = "homie"
 TARGET_PHRASE = "hey homie"
 
+# All audio is converted to 16 kHz mono because openWakeWord expects that.
 SAMPLE_RATE = 16000
+# Training examples are padded to at least this length. 32000 samples = 2 seconds.
 MIN_TOTAL_LENGTH = 32000
+# 0.85 means 85% of positive/negative clips are used for training, 15% for validation.
 TRAIN_SPLIT = 0.85
 
-AUGMENTATION_ROUNDS = 8
-FEATURE_BATCH_SIZE = 64
 
+# How many augmented copies are made while building openWakeWord feature files.
+AUGMENTATION_ROUNDS = 8
+# How many clips are processed at once during feature building. Lower this if you run out of VRAM/RAM.
+FEATURE_BATCH_SIZE = 64
+# More steps can improve the model, but also makes training take longer.
 TRAIN_STEPS = 6000
+# Training batch size. Lower this if the GPU runs out of memory.
 BATCH_SIZE = 256
+# Size of the small neural net layer
 LAYER_SIZE = 128
+# openWakeWord's simple dense model type
 MODEL_TYPE = "dnn"
+# Score threshold used by the quick eval after training.
+EVAL_THRESHOLD = 0.5
 
 
 def wav_files(*parts: str) -> list[Path]:
@@ -206,7 +219,7 @@ def train_model(
     return copy.deepcopy(model.model)
 
 
-def export_models(model: torch.nn.Module, model_name: str, total_length: int, make_tflite: bool) -> None:
+def export_models(model: torch.nn.Module, model_name: str, total_length: int, make_tflite: bool) -> Path:
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
     features = AudioFeatures(device="cpu")
@@ -219,7 +232,7 @@ def export_models(model: torch.nn.Module, model_name: str, total_length: int, ma
     print(f"[export] ONNX created: {onnx_path}")
 
     if not make_tflite:
-        return
+        return onnx_path
 
     tflite_path = MODEL_DIR / f"{model_name}.tflite"
 
@@ -230,14 +243,75 @@ def export_models(model: torch.nn.Module, model_name: str, total_length: int, ma
         print(f"[export] TFLite conversion failed: {error}")
         print("[export] ONNX is still ready. Install the TFLite conversion deps and run again.")
 
+    return onnx_path
+
+
+def score_clip(model: WakewordModel, model_name: str, clip_path: Path) -> float:
+    predictions = model.predict_clip(str(clip_path))
+    scores = predictions.get(model_name, [])
+
+    if isinstance(scores, np.ndarray):
+        if scores.size == 0:
+            return 0.0
+        return float(np.max(scores))
+
+    if not scores:
+        return 0.0
+
+    return float(max(scores))
+
+
+def evaluate_exported_model(
+    model_path: Path,
+    model_name: str,
+    positive_files: list[Path],
+    negative_files: list[Path],
+    threshold: float,
+) -> None:
+    print()
+    print(f"[eval] Loading exported model: {model_path}")
+
+    model = WakewordModel(wakeword_models=[str(model_path)], inference_framework="onnx")
+
+    positive_scores = [score_clip(model, model_name, path) for path in tqdm(positive_files, desc="[eval] positive")]
+    negative_scores = [score_clip(model, model_name, path) for path in tqdm(negative_files, desc="[eval] negative")]
+
+    positive_hits = sum(score >= threshold for score in positive_scores)
+    negative_hits = sum(score >= threshold for score in negative_scores)
+
+    positive_total = max(1, len(positive_scores))
+    negative_total = max(1, len(negative_scores))
+
+    recall = positive_hits / positive_total
+    false_positive_rate = negative_hits / negative_total
+
+    print("[eval] Holdout report")
+    print(f"[eval] Threshold:          {threshold:.2f}")
+    print(f"[eval] Positive recall:    {positive_hits}/{len(positive_scores)} ({recall:.1%})")
+    print(f"[eval] Negative triggers:  {negative_hits}/{len(negative_scores)} ({false_positive_rate:.1%})")
+
+    if positive_scores:
+        print(f"[eval] Positive scores:   avg={np.mean(positive_scores):.3f}, max={np.max(positive_scores):.3f}")
+
+    if negative_scores:
+        print(f"[eval] Negative scores:   avg={np.mean(negative_scores):.3f}, max={np.max(negative_scores):.3f}")
+
+    if recall < 0.8:
+        print("[eval] Heads up: recall is low. Add more positive clips or train longer.")
+
+    if false_positive_rate > 0.05:
+        print("[eval] Heads up: false positives are high. Add more negative/background clips.")
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a custom openWakeWord ONNX/TFLite model.")
     parser.add_argument("--model-name", default=MODEL_NAME)
     parser.add_argument("--target-phrase", default=TARGET_PHRASE)
     parser.add_argument("--steps", type=int, default=TRAIN_STEPS)
+    parser.add_argument("--eval-threshold", type=float, default=EVAL_THRESHOLD)
     parser.add_argument("--overwrite-features", action="store_true")
     parser.add_argument("--no-tflite", action="store_true")
+    parser.add_argument("--skip-eval", action="store_true")
 
     return parser.parse_args()
 
@@ -307,7 +381,16 @@ def main() -> None:
         args.steps,
     )
 
-    export_models(trained_model, args.model_name, total_length, make_tflite=not args.no_tflite)
+    exported_model = export_models(trained_model, args.model_name, total_length, make_tflite=not args.no_tflite)
+
+    if not args.skip_eval:
+        evaluate_exported_model(
+            exported_model,
+            args.model_name,
+            positive_val,
+            negative_val,
+            args.eval_threshold,
+        )
 
     print()
     print("[done] Done.")

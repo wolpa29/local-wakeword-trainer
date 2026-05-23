@@ -55,6 +55,7 @@ The pipeline does this:
 5. build openWakeWord features
 6. train the model
 7. export ONNX and, if possible, TFLite
+8. run a quick holdout check against positive and negative validation clips
 ```
 
 Setup only:
@@ -79,6 +80,18 @@ Only export ONNX if the TFLite conversion is being annoying:
 
 ```bash
 .venv/bin/python scripts/train_openwakeword.py --no-tflite
+```
+
+Skip the quick exported-model check:
+
+```bash
+.venv/bin/python scripts/train_openwakeword.py --skip-eval
+```
+
+Use a stricter/lower detection threshold for the check:
+
+```bash
+.venv/bin/python scripts/train_openwakeword.py --eval-threshold 0.6
 ```
 
 ## Raspberry Pi usage
