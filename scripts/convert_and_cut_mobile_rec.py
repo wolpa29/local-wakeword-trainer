@@ -3,7 +3,7 @@ import subprocess
 from pathlib import Path
 
 
-# ===== Einstellungen =====
+# ===== Settings =====
 
 INPUT_DIR = Path("mobile_uploads/customword")
 OUTPUT_DIR = Path("data/raw/customword")
@@ -14,11 +14,11 @@ TARGET_SAMPLE_FORMAT = "s16"
 
 TRIM_SILENCE = True
 
-# Je näher an 0, desto empfindlicher.
-# -35dB ist vorsichtig, -30dB etwas stärker, -25dB aggressiver.
+# Closer to 0 means stronger silence trimming.
+# -35dB is gentle, -30dB is stronger, -25dB is pretty aggressive.
 SILENCE_THRESHOLD = "-35dB"
 
-# Wie lange Stille erkannt werden muss, bevor getrimmt wird.
+# How long silence has to be before ffmpeg trims it.
 MIN_SILENCE_DURATION = "0.15"
 
 SUPPORTED_EXTENSIONS = {
@@ -41,7 +41,7 @@ SUPPORTED_EXTENSIONS = {
 def check_ffmpeg() -> None:
     if shutil.which("ffmpeg") is None:
         raise RuntimeError(
-            "ffmpeg wurde nicht gefunden. Installiere es mit: winget install Gyan.FFmpeg"
+            "ffmpeg was not found. Install it first, for example with `sudo apt install ffmpeg`."
         )
 
 
@@ -49,10 +49,10 @@ def clean_filename(name: str) -> str:
     name = name.strip().lower()
 
     replacements = {
-        "ä": "ae",
-        "ö": "oe",
-        "ü": "ue",
-        "ß": "ss",
+        "\u00e4": "ae",
+        "\u00f6": "oe",
+        "\u00fc": "ue",
+        "\u00df": "ss",
         " ": "_",
         "-": "_",
     }
@@ -71,7 +71,7 @@ def clean_filename(name: str) -> str:
 
 def find_audio_files() -> list[Path]:
     if not INPUT_DIR.exists():
-        raise FileNotFoundError(f"Input-Ordner nicht gefunden: {INPUT_DIR}")
+        raise FileNotFoundError(f"Input folder not found: {INPUT_DIR}")
 
     return sorted(
         file
@@ -81,7 +81,6 @@ def find_audio_files() -> list[Path]:
 
 
 def unique_output_path(output_dir: Path, filename_stem: str) -> Path:
-    # Kehrt jetzt einfach den Pfad zurück, da wir beim Konvertieren überschreiben wollen.
     return output_dir / f"{filename_stem}.wav"
 
 
@@ -89,7 +88,7 @@ def build_audio_filter() -> str:
     filters = []
 
     if TRIM_SILENCE:
-        # Entfernt Stille am Anfang und Ende vorsichtig.
+        # Gently trim silence from the beginning and end.
         filters.append(
             (
                 f"silenceremove="
@@ -138,17 +137,17 @@ def main() -> None:
     audio_files = find_audio_files()
 
     if not audio_files:
-        print(f"Keine Audiodateien in {INPUT_DIR} gefunden.")
+        print(f"No audio files found in {INPUT_DIR}.")
         return
 
     print(f"Input:  {INPUT_DIR}")
     print(f"Output: {OUTPUT_DIR}")
-    print(f"Dateien: {len(audio_files)}")
+    print(f"Files:  {len(audio_files)}")
     print(f"Trim silence: {TRIM_SILENCE}")
     print()
 
     for input_file in audio_files:
-        # Behalte die Ordnerstruktur bei: mobile_uploads/customword/<sub>/file -> data/raw/customword/<sub>/file.wav
+        # Keep the folder layout: mobile_uploads/customword/<sub>/file -> data/raw/customword/<sub>/file.wav
         relative = input_file.relative_to(INPUT_DIR)
         out_subdir = OUTPUT_DIR / relative.parent
         out_subdir.mkdir(parents=True, exist_ok=True)
@@ -160,7 +159,7 @@ def main() -> None:
         convert_to_wav(input_file, output_file)
 
     print()
-    print("Fertig.")
+    print("Done.")
 
 
 if __name__ == "__main__":

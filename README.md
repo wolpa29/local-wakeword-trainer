@@ -1,94 +1,94 @@
 # local-wakeword-trainer
 
-Trainiert ein eigenes OpenWakeWord-kompatibles Wakeword-Modell aus Handy-Aufnahmen.
+Small pipeline for training my own openWakeWord-compatible wake word model from phone recordings.
 
-Ziel-Artefakte:
+The goal is to end up with:
 
 ```text
 models/homie.onnx
 models/homie.tflite
 ```
 
-Das ONNX/TFLite-Modell kann spaeter auf einem Raspberry Pi mit openWakeWord geladen werden. Die Pipeline ist nicht an Home Assistant gebunden.
+Those files can then be used on a Raspberry Pi with openWakeWord. This repo is not tied to Home Assistant. The plan is just: detect the wake word locally, then hand off to whatever voice assistant / LLM stack I want to run.
 
-## Ordner fuer Handy-Aufnahmen
+## Recording folders
 
-Lege deine Rohaufnahmen hier ab:
+Drop raw phone recordings here:
 
 ```text
 mobile_uploads/customword/
-  positive/      Wakeword, z.B. "hey homie" oder "homie"
-  negative/      Sprache ohne Wakeword, aehnliche Phrasen, normale Kommandos
-  background/    Raumgeraeusche, TV, Musik, Kueche, Tastatur, Stille
-  rir/           Optional: Room impulse responses als WAV
+  positive/      The wake word, for example "hey homie" or "homie"
+  negative/      Speech without the wake word, similar phrases, normal commands
+  background/    Room noise, TV, music, keyboard, kitchen noise, silence
+  rir/           Optional room impulse response WAVs
 ```
 
-Alle gaengigen Handyformate wie `.m4a`, `.mp3`, `.wav`, `.flac`, `.ogg` werden rekursiv gefunden.
+Common phone formats like `.m4a`, `.mp3`, `.wav`, `.flac`, and `.ogg` are found recursively.
 
-Empfehlung fuer einen ersten brauchbaren Lauf:
+For a first useful run I would start around here:
 
 ```text
-positive:   mindestens 20-50 echte Clips, besser 100+
-negative:   mindestens 50 Clips, besser mehrere hundert
-background: mindestens 10 laengere Clips aus echten Einsatzraeumen
+positive:   at least 20-50 real clips, 100+ is better
+negative:   at least 50 clips, a few hundred is better
+background: at least 10 longer clips from real rooms
 ```
 
-Kurze Wakewords wie `homie` sind anfaelliger fuer False Positives. `hey homie` ist meist robuster.
+Very short wake words like `homie` are easier to trigger by accident. `hey homie` should usually be more stable.
 
-## Training starten
+## Run the pipeline
 
-Auf der Ubuntu/RTX-Trainingsmaschine Python 3.10 verwenden:
+Use Python 3.10 on the Ubuntu/RTX training machine:
 
 ```bash
 python3.10 main.py
 ```
 
-Die Pipeline macht:
+The pipeline does this:
 
 ```text
-1. .venv erstellen
-2. requirements installieren
-3. mobile_uploads/customword/* nach data/raw/customword/* konvertieren
-4. data/raw/customword/* nach data/augmented/customword/* augmentieren
-5. OpenWakeWord-Features berechnen
-6. Modell trainieren
-7. ONNX und, falls moeglich, TFLite exportieren
+1. create .venv
+2. install requirements
+3. convert mobile_uploads/customword/* to data/raw/customword/*
+4. augment data/raw/customword/* into data/augmented/customword/*
+5. build openWakeWord features
+6. train the model
+7. export ONNX and, if possible, TFLite
 ```
 
-Nur Setup:
+Setup only:
 
 ```bash
 python3.10 main.py --setup-only
 ```
 
-Training direkt starten:
+Run only the training script:
 
 ```bash
 .venv/bin/python scripts/train_openwakeword.py --model-name homie --target-phrase "hey homie"
 ```
 
-Feature-Dateien neu berechnen:
+Rebuild feature files:
 
 ```bash
 .venv/bin/python scripts/train_openwakeword.py --overwrite-features
 ```
 
-Nur ONNX exportieren, falls TFLite-Konvertierung auf deiner Maschine zickt:
+Only export ONNX if the TFLite conversion is being annoying:
 
 ```bash
 .venv/bin/python scripts/train_openwakeword.py --no-tflite
 ```
 
-## Raspberry Pi Nutzung
+## Raspberry Pi usage
 
-Das fertige Modell liegt unter:
+The finished files should be here:
 
 ```text
 models/homie.onnx
 models/homie.tflite
 ```
 
-In eigener Python-Logik kannst du es mit openWakeWord laden:
+In my own Python code I can load the model like this:
 
 ```python
 from openwakeword.model import Model
@@ -96,11 +96,11 @@ from openwakeword.model import Model
 model = Model(wakeword_models=["models/homie.tflite"])
 ```
 
-Der Audiostream muss 16 kHz, mono, 16-bit PCM liefern.
+The audio stream needs to be 16 kHz, mono, 16-bit PCM.
 
-## Hinweise
+## Setup notes
 
-`ffmpeg` muss fuer die Konvertierung installiert sein.
+`ffmpeg` is needed for converting phone recordings.
 
 Ubuntu:
 
@@ -109,11 +109,11 @@ sudo apt update
 sudo apt install ffmpeg python3.10 python3.10-venv
 ```
 
-Windows ist zum Sortieren/Aufnehmen okay, aber die volle Trainingspipeline ist auf Ubuntu mit Python 3.10 ausgelegt.
+Windows is fine for sorting files and checking the repo, but the full training pipeline is meant for Ubuntu with Python 3.10.
 
-## Public Repo und Lizenzen
+## Public repo / license notes
 
-Dieses Repo enthaelt nur den Pipeline-Code. Audioaufnahmen, Feature-Dateien, Trainingsartefakte und exportierte Modelle werden absichtlich nicht versioniert:
+This repo only tracks the pipeline code. Audio recordings, feature files, training artifacts, and exported models are intentionally ignored:
 
 ```text
 mobile_uploads/
@@ -122,6 +122,6 @@ artifacts/
 models/
 ```
 
-Das Projekt nutzt openWakeWord als Dependency. openWakeWord-Code ist Apache-2.0-lizenziert. Die von openWakeWord bereitgestellten vortrainierten Modelle koennen abweichende, nicht-kommerzielle Lizenzbedingungen haben. Pruefe deshalb die openWakeWord-Lizenzhinweise, bevor du trainierte Modellgewichte oder Modelle kommerziell verwendest oder veroeffentlichst.
+This project depends on openWakeWord. The openWakeWord code is Apache-2.0 licensed. The pretrained models shipped by openWakeWord can have different, non-commercial license terms, so check their license notes before using or publishing trained model weights commercially.
 
-Veroeffentliche keine privaten Sprachaufnahmen, Hintergrundaufnahmen oder Modellartefakte, wenn du nicht die Rechte daran hast.
+Do not publish private voice recordings, background recordings, or generated model files unless you know you have the rights to do that.

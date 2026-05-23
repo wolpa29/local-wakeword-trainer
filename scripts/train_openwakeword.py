@@ -14,7 +14,7 @@ from openwakeword.train import Model, convert_onnx_to_tflite
 from openwakeword.utils import AudioFeatures, compute_features_from_generator, download_models
 
 
-# ===== Einstellungen =====
+# ===== Settings =====
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_ROOT = PROJECT_ROOT / "data"
@@ -95,7 +95,7 @@ def build_feature_file(
     output_file = FEATURE_DIR / f"{name}.npy"
 
     if output_file.exists() and not overwrite:
-        print(f"[features] Nutze vorhandene Datei: {output_file}")
+        print(f"[features] Using existing file: {output_file}")
         return output_file
 
     repeated_files = [str(path) for path in files] * AUGMENTATION_ROUNDS
@@ -106,7 +106,7 @@ def build_feature_file(
         repeated_files *= repeat_factor
         n_total = len(repeated_files)
 
-    print(f"[features] {name}: {len(files)} Clips x {AUGMENTATION_ROUNDS} Runden -> {n_total} Beispiele")
+    print(f"[features] {name}: {len(files)} clips x {AUGMENTATION_ROUNDS} rounds -> {n_total} examples")
 
     generator = augment_clips(
         repeated_files,
@@ -144,7 +144,7 @@ def train_model(
     input_shape = features.get_embedding_shape(total_length / SAMPLE_RATE)
 
     print(f"[train] Input shape: {input_shape}")
-    print(f"[train] CUDA: {'ja' if torch.cuda.is_available() else 'nein'}")
+    print(f"[train] CUDA: {'yes' if torch.cuda.is_available() else 'no'}")
 
     def label(value: int):
         return lambda x: [value for _ in x]
@@ -200,7 +200,7 @@ def train_model(
     )
 
     if model.best_models:
-        print(f"[train] Nutze gemitteltes Modell aus {len(model.best_models)} Checkpoints.")
+        print(f"[train] Averaging {len(model.best_models)} good checkpoints.")
         return model.average_models(models=model.best_models)
 
     return copy.deepcopy(model.model)
@@ -216,7 +216,7 @@ def export_models(model: torch.nn.Module, model_name: str, total_length: int, ma
     wrapper.export_model(model=model, model_name=model_name, output_dir=str(MODEL_DIR))
     onnx_path = MODEL_DIR / f"{model_name}.onnx"
 
-    print(f"[export] ONNX erstellt: {onnx_path}")
+    print(f"[export] ONNX created: {onnx_path}")
 
     if not make_tflite:
         return
@@ -225,14 +225,14 @@ def export_models(model: torch.nn.Module, model_name: str, total_length: int, ma
 
     try:
         convert_onnx_to_tflite(str(onnx_path), str(tflite_path))
-        print(f"[export] TFLite erstellt: {tflite_path}")
+        print(f"[export] TFLite created: {tflite_path}")
     except Exception as error:
-        print(f"[export] TFLite-Konvertierung fehlgeschlagen: {error}")
-        print("[export] ONNX ist trotzdem fertig. Installiere die TFLite-Konvertierungsdeps und starte erneut.")
+        print(f"[export] TFLite conversion failed: {error}")
+        print("[export] ONNX is still ready. Install the TFLite conversion deps and run again.")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Trainiert ein eigenes OpenWakeWord ONNX/TFLite-Modell.")
+    parser = argparse.ArgumentParser(description="Train a custom openWakeWord ONNX/TFLite model.")
     parser.add_argument("--model-name", default=MODEL_NAME)
     parser.add_argument("--target-phrase", default=TARGET_PHRASE)
     parser.add_argument("--steps", type=int, default=TRAIN_STEPS)
@@ -264,14 +264,14 @@ def main() -> None:
 
     if len(positive_files) < 20:
         raise RuntimeError(
-            f"Zu wenige positive WAVs ({len(positive_files)}). "
-            "Nimm mindestens 20-50 echte Wakeword-Clips auf, besser mehr."
+            f"Not enough positive WAVs ({len(positive_files)}). "
+            "Record at least 20-50 real wake word clips. More is better."
         )
 
     if len(negative_files) < 20:
         raise RuntimeError(
-            f"Zu wenige negative/background WAVs ({len(negative_files)}). "
-            "Nimm normale Sprache, TV/Musik, Raumgeraeusche und Nicht-Wakeword-Phrasen auf."
+            f"Not enough negative/background WAVs ({len(negative_files)}). "
+            "Record normal speech, TV/music, room noise, and phrases that are not the wake word."
         )
 
     print(f"[data] Positive WAVs:   {len(positive_files)}")
@@ -280,7 +280,7 @@ def main() -> None:
     print(f"[data] RIR WAVs:        {len(rir_files)}")
 
     total_length = determine_total_length(positive_files)
-    print(f"[data] Clip-Laenge fuer Training: {total_length / SAMPLE_RATE:.2f}s")
+    print(f"[data] Training clip length: {total_length / SAMPLE_RATE:.2f}s")
 
     positive_train, positive_val = split_files(positive_files, TRAIN_SPLIT)
     negative_train, negative_val = split_files(negative_files, TRAIN_SPLIT)
@@ -310,7 +310,7 @@ def main() -> None:
     export_models(trained_model, args.model_name, total_length, make_tflite=not args.no_tflite)
 
     print()
-    print("[done] Fertig.")
+    print("[done] Done.")
 
 
 if __name__ == "__main__":
