@@ -25,6 +25,8 @@ mobile_uploads/customword/
 
 Common phone formats like `.m4a`, `.mp3`, `.wav`, `.flac`, and `.ogg` are found recursively.
 
+`background/` and `rir/` clips are converted to 16 kHz WAV, but they are not silence-trimmed or duplicated by the simple augmentation script. They are used later as room/noise material while building training features.
+
 For a first useful run I would start around here:
 
 ```text

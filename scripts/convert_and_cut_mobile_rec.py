@@ -13,6 +13,7 @@ TARGET_CHANNELS = "1"
 TARGET_SAMPLE_FORMAT = "s16"
 
 TRIM_SILENCE = True
+NO_TRIM_FOLDERS = {"background", "rir"}
 
 # Closer to 0 means stronger silence trimming.
 # -35dB is gentle, -30dB is stronger, -25dB is pretty aggressive.
@@ -84,10 +85,15 @@ def unique_output_path(output_dir: Path, filename_stem: str) -> Path:
     return output_dir / f"{filename_stem}.wav"
 
 
-def build_audio_filter() -> str:
+def should_trim_silence(input_file: Path) -> bool:
+    relative_parts = input_file.relative_to(INPUT_DIR).parts
+    return TRIM_SILENCE and not any(part in NO_TRIM_FOLDERS for part in relative_parts)
+
+
+def build_audio_filter(trim_silence: bool) -> str:
     filters = []
 
-    if TRIM_SILENCE:
+    if trim_silence:
         # Gently trim silence from the beginning and end.
         filters.append(
             (
@@ -104,7 +110,7 @@ def build_audio_filter() -> str:
     return ",".join(filters)
 
 
-def convert_to_wav(input_file: Path, output_file: Path) -> None:
+def convert_to_wav(input_file: Path, output_file: Path, trim_silence: bool) -> None:
     command = [
         "ffmpeg",
         "-y",
@@ -119,7 +125,7 @@ def convert_to_wav(input_file: Path, output_file: Path) -> None:
         TARGET_SAMPLE_FORMAT,
     ]
 
-    audio_filter = build_audio_filter()
+    audio_filter = build_audio_filter(trim_silence)
 
     if audio_filter:
         command.extend(["-af", audio_filter])
@@ -143,7 +149,7 @@ def main() -> None:
     print(f"Input:  {INPUT_DIR}")
     print(f"Output: {OUTPUT_DIR}")
     print(f"Files:  {len(audio_files)}")
-    print(f"Trim silence: {TRIM_SILENCE}")
+    print(f"Trim silence: {TRIM_SILENCE} except for {', '.join(sorted(NO_TRIM_FOLDERS))}")
     print()
 
     for input_file in audio_files:
@@ -154,9 +160,10 @@ def main() -> None:
 
         clean_stem = clean_filename(input_file.stem)
         output_file = unique_output_path(out_subdir, clean_stem)
+        trim_silence = should_trim_silence(input_file)
 
-        print(f"{input_file.name} -> {output_file.relative_to(OUTPUT_DIR)}")
-        convert_to_wav(input_file, output_file)
+        print(f"{input_file.name} -> {output_file.relative_to(OUTPUT_DIR)} (trim={trim_silence})")
+        convert_to_wav(input_file, output_file, trim_silence)
 
     print()
     print("Done.")

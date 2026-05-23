@@ -21,6 +21,7 @@ SPEED_RANGE = (0.92, 1.08)
 NOISE_LEVEL_RANGE = (0.001, 0.008)
 
 SUPPORTED_EXTENSIONS = {".wav"}
+AUGMENT_FOLDERS = {"positive", "negative"}
 
 
 def read_wav(path: Path) -> tuple[np.ndarray, int]:
@@ -112,7 +113,11 @@ def find_wav_files() -> list[Path]:
     return sorted(
         file
         for file in INPUT_DIR.rglob("*.wav")
-        if file.is_file() and file.suffix.lower() in SUPPORTED_EXTENSIONS
+        if (
+            file.is_file()
+            and file.suffix.lower() in SUPPORTED_EXTENSIONS
+            and any(part in AUGMENT_FOLDERS for part in file.relative_to(INPUT_DIR).parts)
+        )
     )
 
 
@@ -129,6 +134,7 @@ def main() -> None:
     print(f"Output: {OUTPUT_DIR}")
     print(f"Files:  {len(wav_files)}")
     print(f"Variants per file: {AUGMENTATIONS_PER_FILE}")
+    print(f"Folders: {', '.join(sorted(AUGMENT_FOLDERS))}")
     print()
 
     created = 0
