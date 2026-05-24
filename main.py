@@ -9,6 +9,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent
 VENV_DIR = PROJECT_ROOT / ".venv"
 REQUIREMENTS_FILE = PROJECT_ROOT / "requirements.txt"
+OPENWAKEWORD_PACKAGE = "openwakeword==0.6.0"
 
 PIPELINE_SCRIPTS = [
     PROJECT_ROOT / "scripts" / "convert_and_cut_mobile_rec.py",
@@ -57,11 +58,32 @@ def install_requirements(python_path: Path) -> None:
             "-m",
             "pip",
             "install",
+            "--quiet",
             "-r",
             str(REQUIREMENTS_FILE),
         ],
         "Installing requirements",
     )
+    run(
+        [
+            str(python_path),
+            "-m",
+            "pip",
+            "install",
+            "--quiet",
+            "--no-deps",
+            OPENWAKEWORD_PACKAGE,
+        ],
+        "Installing openWakeWord without legacy TFLite runtime dependency",
+    )
+
+
+def build_train_command(python_path: Path) -> list[str]:
+    return [str(python_path), str(PROJECT_ROOT / "scripts" / "train_openwakeword.py")]
+
+
+def build_convert_command(python_path: Path) -> list[str]:
+    return [str(python_path), str(PROJECT_ROOT / "scripts" / "convert_and_cut_mobile_rec.py")]
 
 
 def run_pipeline(python_path: Path) -> None:
@@ -69,7 +91,14 @@ def run_pipeline(python_path: Path) -> None:
         if not script.exists():
             raise FileNotFoundError(f"Script not found: {script}")
 
-        run([str(python_path), str(script)], f"Running {script.relative_to(PROJECT_ROOT)}")
+        if script.name == "convert_and_cut_mobile_rec.py":
+            command = build_convert_command(python_path)
+        elif script.name == "train_openwakeword.py":
+            command = build_train_command(python_path)
+        else:
+            command = [str(python_path), str(script)]
+
+        run(command, f"Running {script.relative_to(PROJECT_ROOT)}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -86,18 +115,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not install requirements.",
     )
-
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-
-    if not args.setup_only and sys.version_info >= (3, 11):
-        raise RuntimeError(
-            "The full openWakeWord training pipeline is built around Python 3.10. "
-            "Please run it on the training machine with Python 3.10, for example `python3.10 main.py`."
-        )
 
     python_path = ensure_venv()
 

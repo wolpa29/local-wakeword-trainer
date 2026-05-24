@@ -1,18 +1,33 @@
-import argparse
 import copy
+import contextlib
+import io
+import json
 import logging
 import math
+import sys
+import warnings
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
+warnings.filterwarnings("ignore", message="pkg_resources is deprecated as an API.*", category=UserWarning)
+warnings.filterwarnings("ignore", message="Specified provider 'CUDAExecutionProvider'.*", category=UserWarning)
+warnings.filterwarnings("ignore", message="Transforms now expect an `output_type` argument.*", category=FutureWarning)
+warnings.filterwarnings("ignore", message="Warning: input samples dtype is np.float64.*", category=UserWarning)
+warnings.filterwarnings("ignore", message="`isinstance\\(treespec, LeafSpec\\)` is deprecated.*", category=FutureWarning)
+
 import numpy as np
-import scipy.io.wavfile
+import soundfile as sf
 import torch
+import torchaudio
+from numpy.lib.format import open_memmap
 from tqdm import tqdm
 
-from openwakeword.model import Model as WakewordModel
-from openwakeword.data import augment_clips, mmap_batch_generator
-from openwakeword.train import Model, convert_onnx_to_tflite
-from openwakeword.utils import AudioFeatures, compute_features_from_generator, download_models
+with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+    from openwakeword.model import Model as WakewordModel
+    from openwakeword.data import augment_clips, mmap_batch_generator, trim_mmap
+    from openwakeword.train import Model, convert_onnx_to_tflite
+    from openwakeword.utils import AudioFeatures, download_models
 
 
 # ===== Settings =====
@@ -43,26 +58,75 @@ AUGMENTATION_ROUNDS = 8
 # How many clips are processed at once during feature building. Lower this if you run out of VRAM/RAM.
 FEATURE_BATCH_SIZE = 64
 # More steps can improve the model, but also makes training take longer.
-TRAIN_STEPS = 6000
+# 20000+ steps recommended for good quality models
+TRAIN_STEPS = 25000
+# Rebuild feature files on every normal run so changed audio files are used.
+OVERWRITE_FEATURES = True
+# TFLite export only works with the legacy Python 3.10 stack. ONNX is the main output on Python 3.12.
+MAKE_TFLITE = False
+# Keep the validation report enabled by default.
+RUN_EVAL = True
 # Training batch size. Lower this if the GPU runs out of memory.
-BATCH_SIZE = 256
+# Larger batches (512+) train faster and often better with sufficient RAM/GPU
+BATCH_SIZE = 512
 # Size of the small neural net layer
-LAYER_SIZE = 128
+# 256 is recommended for better model capacity (default in openwakeword)
+LAYER_SIZE = 256
+# Learning rate for training. Higher = faster but riskier, Lower = slower but more stable.
+LEARNING_RATE = 0.0001
 # openWakeWord's simple dense model type
 MODEL_TYPE = "dnn"
-# Score threshold used by the quick eval after training.
-EVAL_THRESHOLD = 0.5
+FEATURE_INFERENCE_FRAMEWORK = "onnx"
+THRESHOLD_REPORT_VALUES = [round(value, 2) for value in np.arange(0.05, 1.0, 0.05)]
+
+
+@dataclass
+class AudioInfo:
+    num_frames: int
+    sample_rate: int
+
+
+@dataclass
+class TrainingFiles:
+    positive: list[Path]
+    negative: list[Path]
+    background: list[Path]
+    rir: list[Path]
+
+
+@dataclass
+class FeatureFiles:
+    positive_train: Path
+    positive_val: Path
+    negative_train: Path
+    negative_val: Path
+
+
+def can_convert_tflite() -> bool:
+    return sys.version_info < (3, 11)
+
+
+def install_torchaudio_info_compat() -> None:
+    if hasattr(torchaudio, "info"):
+        return
+
+    def info(path: str) -> AudioInfo:
+        metadata = sf.info(path)
+        return AudioInfo(num_frames=metadata.frames, sample_rate=metadata.samplerate)
+
+    torchaudio.info = info
 
 
 def wav_files(*parts: str) -> list[Path]:
-    files: list[Path] = []
-
-    for base in (RAW_DIR, AUGMENTED_DIR):
-        directory = base.joinpath(*parts)
-        if directory.exists():
-            files.extend(directory.rglob("*.wav"))
-
-    return sorted(path for path in files if path.is_file())
+    """Return WAV files from both raw and locally augmented folders."""
+    directories = [base.joinpath(*parts) for base in (RAW_DIR, AUGMENTED_DIR)]
+    return sorted(
+        path
+        for directory in directories
+        if directory.exists()
+        for path in directory.rglob("*.wav")
+        if path.is_file()
+    )
 
 
 def split_files(files: list[Path], train_split: float) -> tuple[list[Path], list[Path]]:
@@ -78,12 +142,12 @@ def split_files(files: list[Path], train_split: float) -> tuple[list[Path], list
 
 
 def read_duration_samples(path: Path) -> int:
-    sample_rate, audio = scipy.io.wavfile.read(path)
+    audio_info = sf.info(path)
 
-    if sample_rate != SAMPLE_RATE:
-        raise ValueError(f"{path} hat {sample_rate} Hz statt {SAMPLE_RATE} Hz.")
+    if audio_info.samplerate != SAMPLE_RATE:
+        raise ValueError(f"{path} has {audio_info.samplerate} Hz instead of {SAMPLE_RATE} Hz.")
 
-    return int(audio.shape[0])
+    return int(audio_info.frames)
 
 
 def determine_total_length(positive_files: list[Path]) -> int:
@@ -129,7 +193,7 @@ def build_feature_file(
         RIR_paths=[str(path) for path in rir_files],
     )
 
-    compute_features_from_generator(
+    compute_features_from_generator_onnx(
         generator,
         n_total=n_total,
         clip_duration=total_length,
@@ -141,8 +205,88 @@ def build_feature_file(
     return output_file
 
 
+def write_feature_batch(
+    feature_file: np.memmap,
+    row_counter: int,
+    audio_batch: np.ndarray,
+    features_model: AudioFeatures,
+    batch_size: int,
+    ncpu: int,
+    n_total: int,
+) -> int:
+    features = features_model.embed_clips(audio_batch, batch_size=batch_size, ncpu=ncpu)
+
+    if row_counter + features.shape[0] > n_total:
+        features = features[0:n_total - row_counter]
+
+    feature_file[row_counter:row_counter + features.shape[0], :, :] = features
+    feature_file.flush()
+
+    return row_counter + features.shape[0]
+
+
+def compute_features_from_generator_onnx(
+    generator,
+    n_total: int,
+    clip_duration: int,
+    output_file: str,
+    device: str = "cpu",
+    ncpu: int = 1,
+) -> None:
+    features_model = AudioFeatures(
+        device=device,
+        ncpu=ncpu,
+        inference_framework=FEATURE_INFERENCE_FRAMEWORK,
+    )
+    n_feature_cols = features_model.get_embedding_shape(clip_duration / SAMPLE_RATE)
+    output_shape = (n_total, n_feature_cols[0], n_feature_cols[1])
+    feature_file = open_memmap(output_file, mode="w+", dtype=np.float32, shape=output_shape)
+
+    row_counter = 0
+    first_audio_batch = next(generator)
+    batch_size = first_audio_batch.shape[0]
+
+    if batch_size > n_total:
+        raise ValueError(
+            f"The value of n_total ({n_total}) is less than the batch size ({batch_size}). "
+            "Increase n_total so it is at least the batch size."
+        )
+
+    progress_bar = tqdm(total=math.ceil(n_total / batch_size), desc="Computing features")
+
+    row_counter = write_feature_batch(
+        feature_file, row_counter, first_audio_batch, features_model, batch_size, ncpu, n_total
+    )
+    progress_bar.update(1)
+
+    for audio_batch in generator:
+        if row_counter >= n_total:
+            break
+
+        row_counter = write_feature_batch(
+            feature_file, row_counter, audio_batch, features_model, batch_size, ncpu, n_total
+        )
+        progress_bar.update(1)
+
+    progress_bar.close()
+    trim_mmap(output_file)
+
+
 def load_features(path: Path) -> np.ndarray:
     return np.load(path)
+
+
+def create_label_function(value: int):
+    return lambda batch: [value for _ in batch]
+
+
+class FeatureBatchDataset(torch.utils.data.IterableDataset):
+    def __init__(self, batch_generator) -> None:
+        super().__init__()
+        self.batch_generator = batch_generator
+
+    def __iter__(self):
+        return self.batch_generator
 
 
 def train_model(
@@ -153,14 +297,11 @@ def train_model(
     total_length: int,
     steps: int,
 ) -> torch.nn.Module:
-    features = AudioFeatures(device="cpu")
+    features = AudioFeatures(device="cpu", inference_framework=FEATURE_INFERENCE_FRAMEWORK)
     input_shape = features.get_embedding_shape(total_length / SAMPLE_RATE)
 
     print(f"[train] Input shape: {input_shape}")
     print(f"[train] CUDA: {'yes' if torch.cuda.is_available() else 'no'}")
-
-    def label(value: int):
-        return lambda x: [value for _ in x]
 
     batch_generator = mmap_batch_generator(
         {
@@ -169,15 +310,18 @@ def train_model(
         },
         batch_size=BATCH_SIZE,
         n_per_class={"1": BATCH_SIZE // 2, "0": BATCH_SIZE // 2},
-        label_transform_funcs={"1": label(1), "0": label(0)},
+        label_transform_funcs={
+            "1": create_label_function(1),
+            "0": create_label_function(0),
+        },
     )
 
-    class IterDataset(torch.utils.data.IterableDataset):
-        def __iter__(self):
-            return batch_generator
-
     workers = 0 if torch.cuda.is_available() else max(1, min(4, torch.get_num_threads() // 2))
-    x_train = torch.utils.data.DataLoader(IterDataset(), batch_size=None, num_workers=workers)
+    x_train = torch.utils.data.DataLoader(
+        FeatureBatchDataset(batch_generator),
+        batch_size=None,
+        num_workers=workers,
+    )
 
     x_val_pos = load_features(positive_val_features)
     x_val_neg = load_features(negative_val_features)
@@ -207,9 +351,9 @@ def train_model(
         max_steps=steps,
         negative_weight_schedule=weights,
         val_steps=val_steps,
-        warmup_steps=max(1, steps // 5),
-        hold_steps=max(1, steps // 3),
-        lr=0.0001,
+        warmup_steps=max(1, steps // 10),
+        hold_steps=max(1, steps // 4),
+        lr=LEARNING_RATE,
     )
 
     if model.best_models:
@@ -222,16 +366,31 @@ def train_model(
 def export_models(model: torch.nn.Module, model_name: str, total_length: int, make_tflite: bool) -> Path:
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-    features = AudioFeatures(device="cpu")
+    features = AudioFeatures(device="cpu", inference_framework=FEATURE_INFERENCE_FRAMEWORK)
     input_shape = features.get_embedding_shape(total_length / SAMPLE_RATE)
-    wrapper = Model(n_classes=1, input_shape=input_shape, model_type=MODEL_TYPE, layer_dim=LAYER_SIZE)
-
-    wrapper.export_model(model=model, model_name=model_name, output_dir=str(MODEL_DIR))
     onnx_path = MODEL_DIR / f"{model_name}.onnx"
+
+    print(f"[export] Saving ONNX model: {onnx_path}")
+    model_to_save = copy.deepcopy(model).to("cpu")
+    model_to_save.eval()
+    example_input = torch.rand(input_shape)[None,]
+
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        torch.onnx.export(
+            model_to_save,
+            example_input,
+            str(onnx_path),
+            opset_version=18,
+            dynamo=False,
+        )
 
     print(f"[export] ONNX created: {onnx_path}")
 
     if not make_tflite:
+        return onnx_path
+
+    if not can_convert_tflite():
+        print("[export] Skipping TFLite: the bundled conversion stack only supports Python 3.10.")
         return onnx_path
 
     tflite_path = MODEL_DIR / f"{model_name}.tflite"
@@ -246,14 +405,31 @@ def export_models(model: torch.nn.Module, model_name: str, total_length: int, ma
     return onnx_path
 
 
+def normalize_prediction_scores(predictions, model_name: str) -> list[float]:
+    if isinstance(predictions, list):
+        return [
+            item.get(model_name, 0.0)
+            for item in predictions
+            if isinstance(item, dict)
+        ]
+
+    if isinstance(predictions, dict):
+        scores = predictions.get(model_name, [])
+
+        if isinstance(scores, np.ndarray):
+            return scores.astype(float).tolist()
+
+        if isinstance(scores, (float, int)):
+            return [float(scores)]
+
+        return list(scores)
+
+    return []
+
+
 def score_clip(model: WakewordModel, model_name: str, clip_path: Path) -> float:
     predictions = model.predict_clip(str(clip_path))
-    scores = predictions.get(model_name, [])
-
-    if isinstance(scores, np.ndarray):
-        if scores.size == 0:
-            return 0.0
-        return float(np.max(scores))
+    scores = normalize_prediction_scores(predictions, model_name)
 
     if not scores:
         return 0.0
@@ -261,13 +437,53 @@ def score_clip(model: WakewordModel, model_name: str, clip_path: Path) -> float:
     return float(max(scores))
 
 
+def count_scores_at_or_above(scores: list[float], threshold: float) -> int:
+    return sum(score >= threshold for score in scores)
+
+
+def build_threshold_report(positive_scores: list[float], negative_scores: list[float]) -> list[dict]:
+    positive_total = max(1, len(positive_scores))
+    negative_total = max(1, len(negative_scores))
+    report = []
+
+    for threshold in THRESHOLD_REPORT_VALUES:
+        positive_hits = count_scores_at_or_above(positive_scores, threshold)
+        negative_hits = count_scores_at_or_above(negative_scores, threshold)
+
+        report.append(
+            {
+                "threshold": threshold,
+                "positive_hits": int(positive_hits),
+                "positive_total": len(positive_scores),
+                "recall": positive_hits / positive_total,
+                "negative_triggers": int(negative_hits),
+                "negative_total": len(negative_scores),
+                "false_positive_rate": negative_hits / negative_total,
+            }
+        )
+
+    return report
+
+
+def print_threshold_summary(threshold_report: list[dict]) -> None:
+    print("[eval] Threshold check:")
+
+    for row in threshold_report:
+        if row["threshold"] not in {0.5, 0.6, 0.7, 0.8, 0.9, 0.95}:
+            continue
+
+        print(
+            f"[eval]   {row['threshold']:.2f}: "
+            f"recall={row['recall']:.1%}, false positives={row['false_positive_rate']:.1%}"
+        )
+
+
 def evaluate_exported_model(
     model_path: Path,
     model_name: str,
     positive_files: list[Path],
     negative_files: list[Path],
-    threshold: float,
-) -> None:
+) -> dict:
     print()
     print(f"[eval] Loading exported model: {model_path}")
 
@@ -276,19 +492,20 @@ def evaluate_exported_model(
     positive_scores = [score_clip(model, model_name, path) for path in tqdm(positive_files, desc="[eval] positive")]
     negative_scores = [score_clip(model, model_name, path) for path in tqdm(negative_files, desc="[eval] negative")]
 
-    positive_hits = sum(score >= threshold for score in positive_scores)
-    negative_hits = sum(score >= threshold for score in negative_scores)
-
-    positive_total = max(1, len(positive_scores))
-    negative_total = max(1, len(negative_scores))
-
-    recall = positive_hits / positive_total
-    false_positive_rate = negative_hits / negative_total
+    threshold_report = build_threshold_report(positive_scores, negative_scores)
+    default_threshold = 0.5
+    default_row = next(row for row in threshold_report if row["threshold"] == default_threshold)
 
     print("[eval] Holdout report")
-    print(f"[eval] Threshold:          {threshold:.2f}")
-    print(f"[eval] Positive recall:    {positive_hits}/{len(positive_scores)} ({recall:.1%})")
-    print(f"[eval] Negative triggers:  {negative_hits}/{len(negative_scores)} ({false_positive_rate:.1%})")
+    print(f"[eval] Threshold:          {default_threshold:.2f}")
+    print(
+        f"[eval] Positive recall:    "
+        f"{default_row['positive_hits']}/{len(positive_scores)} ({default_row['recall']:.1%})"
+    )
+    print(
+        f"[eval] Negative triggers:  "
+        f"{default_row['negative_triggers']}/{len(negative_scores)} ({default_row['false_positive_rate']:.1%})"
+    )
 
     if positive_scores:
         print(f"[eval] Positive scores:   avg={np.mean(positive_scores):.3f}, max={np.max(positive_scores):.3f}")
@@ -296,38 +513,42 @@ def evaluate_exported_model(
     if negative_scores:
         print(f"[eval] Negative scores:   avg={np.mean(negative_scores):.3f}, max={np.max(negative_scores):.3f}")
 
-    if recall < 0.8:
-        print("[eval] Heads up: recall is low. Add more positive clips or train longer.")
+    print_threshold_summary(threshold_report)
 
-    if false_positive_rate > 0.05:
-        print("[eval] Heads up: false positives are high. Add more negative/background clips.")
+    return {
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "model_name": model_name,
+        "model_path": str(model_path.relative_to(PROJECT_ROOT)),
+        "threshold_report": threshold_report,
+        "positive": {
+            "total": len(positive_scores),
+            "hits": int(default_row["positive_hits"]),
+            "recall": default_row["recall"],
+            "average_score": float(np.mean(positive_scores)) if positive_scores else 0.0,
+            "max_score": float(np.max(positive_scores)) if positive_scores else 0.0,
+            "scores": [float(score) for score in positive_scores],
+            "files": [str(path.relative_to(PROJECT_ROOT)) for path in positive_files],
+        },
+        "negative": {
+            "total": len(negative_scores),
+            "triggers": int(default_row["negative_triggers"]),
+            "false_positive_rate": default_row["false_positive_rate"],
+            "average_score": float(np.mean(negative_scores)) if negative_scores else 0.0,
+            "max_score": float(np.max(negative_scores)) if negative_scores else 0.0,
+            "scores": [float(score) for score in negative_scores],
+            "files": [str(path.relative_to(PROJECT_ROOT)) for path in negative_files],
+        },
+    }
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train a custom openWakeWord ONNX/TFLite model.")
-    parser.add_argument("--model-name", default=MODEL_NAME)
-    parser.add_argument("--target-phrase", default=TARGET_PHRASE)
-    parser.add_argument("--steps", type=int, default=TRAIN_STEPS)
-    parser.add_argument("--eval-threshold", type=float, default=EVAL_THRESHOLD)
-    parser.add_argument("--overwrite-features", action="store_true")
-    parser.add_argument("--no-tflite", action="store_true")
-    parser.add_argument("--skip-eval", action="store_true")
-
-    return parser.parse_args()
+def save_eval_result(model_path: Path, eval_result: dict) -> Path:
+    eval_path = model_path.with_suffix(".eval.json")
+    eval_path.write_text(json.dumps(eval_result, indent=2), encoding="utf-8")
+    print(f"[eval] Saved validation result: {eval_path}")
+    return eval_path
 
 
-def main() -> None:
-    args = parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
-
-    FEATURE_DIR.mkdir(parents=True, exist_ok=True)
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
-
-    print(f"[start] Wake phrase: {args.target_phrase}")
-    print(f"[start] Model name:  {args.model_name}")
-
-    download_models()
-
+def collect_training_files() -> TrainingFiles:
     positive_files = wav_files("positive")
     negative_files = wav_files("negative")
     background_files = wav_files("background")
@@ -336,61 +557,105 @@ def main() -> None:
     if background_files:
         negative_files = sorted(set(negative_files + background_files))
 
-    if len(positive_files) < 20:
+    return TrainingFiles(
+        positive=positive_files,
+        negative=negative_files,
+        background=background_files,
+        rir=rir_files,
+    )
+
+
+def check_training_files(files: TrainingFiles) -> None:
+    if len(files.positive) < 20:
         raise RuntimeError(
-            f"Not enough positive WAVs ({len(positive_files)}). "
+            f"Not enough positive WAVs ({len(files.positive)}). "
             "Record at least 20-50 real wake word clips. More is better."
         )
 
-    if len(negative_files) < 20:
+    if len(files.negative) < 20:
         raise RuntimeError(
-            f"Not enough negative/background WAVs ({len(negative_files)}). "
+            f"Not enough negative/background WAVs ({len(files.negative)}). "
             "Record normal speech, TV/music, room noise, and phrases that are not the wake word."
         )
 
-    print(f"[data] Positive WAVs:   {len(positive_files)}")
-    print(f"[data] Negative WAVs:   {len(negative_files)}")
-    print(f"[data] Background WAVs: {len(background_files)}")
-    print(f"[data] RIR WAVs:        {len(rir_files)}")
 
-    total_length = determine_total_length(positive_files)
+def print_training_file_summary(files: TrainingFiles) -> None:
+    print(f"[data] Positive WAVs:   {len(files.positive)}")
+    print(f"[data] Negative WAVs:   {len(files.negative)} (includes background if available)")
+    print(f"[data] Background WAVs: {len(files.background)} (used for augmentation)")
+    print(f"[data] RIR WAVs:        {len(files.rir)} (used for reverb augmentation)")
+
+
+def build_all_feature_files(files: TrainingFiles, total_length: int, overwrite: bool) -> tuple[FeatureFiles, list[Path], list[Path]]:
+    positive_train, positive_val = split_files(files.positive, TRAIN_SPLIT)
+    negative_train, negative_val = split_files(files.negative, TRAIN_SPLIT)
+
+    feature_files = FeatureFiles(
+        positive_train=build_feature_file(
+            "positive_train", positive_train, total_length, files.background, files.rir, overwrite
+        ),
+        positive_val=build_feature_file(
+            "positive_val", positive_val, total_length, files.background, files.rir, overwrite
+        ),
+        negative_train=build_feature_file(
+            "negative_train", negative_train, total_length, files.background, files.rir, overwrite
+        ),
+        negative_val=build_feature_file(
+            "negative_val", negative_val, total_length, files.background, files.rir, overwrite
+        ),
+    )
+
+    return feature_files, positive_val, negative_val
+
+
+def main() -> None:
+    install_torchaudio_info_compat()
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+    FEATURE_DIR.mkdir(parents=True, exist_ok=True)
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+    print(f"[start] Wake phrase: {TARGET_PHRASE}")
+    print(f"[start] Model name:  {MODEL_NAME}")
+
+    download_models()
+
+    training_files = collect_training_files()
+    check_training_files(training_files)
+    print_training_file_summary(training_files)
+
+    total_length = determine_total_length(training_files.positive)
     print(f"[data] Training clip length: {total_length / SAMPLE_RATE:.2f}s")
 
-    positive_train, positive_val = split_files(positive_files, TRAIN_SPLIT)
-    negative_train, negative_val = split_files(negative_files, TRAIN_SPLIT)
+    feature_files, positive_val, negative_val = build_all_feature_files(
+        training_files,
+        total_length,
+        OVERWRITE_FEATURES,
+    )
 
-    positive_train_features = build_feature_file(
-        "positive_train", positive_train, total_length, background_files, rir_files, args.overwrite_features
-    )
-    positive_val_features = build_feature_file(
-        "positive_val", positive_val, total_length, background_files, rir_files, args.overwrite_features
-    )
-    negative_train_features = build_feature_file(
-        "negative_train", negative_train, total_length, background_files, rir_files, args.overwrite_features
-    )
-    negative_val_features = build_feature_file(
-        "negative_val", negative_val, total_length, background_files, rir_files, args.overwrite_features
-    )
+    print(f"[data] Feature files ready in {FEATURE_DIR}")
+    print(f"[train] Using {TRAIN_STEPS} steps, batch size {BATCH_SIZE}, layer size {LAYER_SIZE}")
+    print("[train] Starting training... (progress will be shown by openWakeWord)")
 
     trained_model = train_model(
-        positive_train_features,
-        negative_train_features,
-        positive_val_features,
-        negative_val_features,
+        feature_files.positive_train,
+        feature_files.negative_train,
+        feature_files.positive_val,
+        feature_files.negative_val,
         total_length,
-        args.steps,
+        TRAIN_STEPS,
     )
 
-    exported_model = export_models(trained_model, args.model_name, total_length, make_tflite=not args.no_tflite)
+    exported_model = export_models(trained_model, MODEL_NAME, total_length, make_tflite=MAKE_TFLITE)
 
-    if not args.skip_eval:
-        evaluate_exported_model(
+    if RUN_EVAL:
+        eval_result = evaluate_exported_model(
             exported_model,
-            args.model_name,
+            MODEL_NAME,
             positive_val,
             negative_val,
-            args.eval_threshold,
         )
+        save_eval_result(exported_model, eval_result)
 
     print()
     print("[done] Done.")

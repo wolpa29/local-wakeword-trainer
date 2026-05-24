@@ -1,142 +1,125 @@
 # local-wakeword-trainer
 
-Small pipeline for training my own openWakeWord-compatible wake word model from phone recordings.
+Small local pipeline for training an openWakeWord wake word model from phone recordings.
 
-The goal is to end up with:
-
-```text
-models/homie.onnx
-models/homie.tflite
-```
-
-Those files can then be used on a Raspberry Pi with openWakeWord. This repo is not tied to Home Assistant. The plan is just: detect the wake word locally, then hand off to whatever voice assistant / LLM stack I want to run.
-
-## Recording folders
-
-Drop raw phone recordings here:
-
-```text
-mobile_uploads/customword/
-  positive/      The wake word, for example "hey homie" or "homie"
-  negative/      Speech without the wake word, similar phrases, normal commands
-  background/    Room noise, TV, music, keyboard, kitchen noise, silence
-  rir/           Optional room impulse response WAVs
-```
-
-Common phone formats like `.m4a`, `.mp3`, `.wav`, `.flac`, and `.ogg` are found recursively.
-
-`background/` and `rir/` clips are converted to 16 kHz WAV, but they are not silence-trimmed or duplicated by the simple augmentation script. They are used later as room/noise material while building training features.
-
-For a first useful run I would start around here:
-
-```text
-positive:   at least 20-50 real clips, 100+ is better
-negative:   at least 50 clips, a few hundred is better
-background: at least 10 longer clips from real rooms
-```
-
-Very short wake words like `homie` are easier to trigger by accident. `hey homie` should usually be more stable.
-
-## Run the pipeline
-
-Use Python 3.10 on the Ubuntu/RTX training machine:
-
-```bash
-python3.10 main.py
-```
-
-The pipeline does this:
-
-```text
-1. create .venv
-2. install requirements
-3. convert mobile_uploads/customword/* to data/raw/customword/*
-4. augment data/raw/customword/* into data/augmented/customword/*
-5. build openWakeWord features
-6. train the model
-7. export ONNX and, if possible, TFLite
-8. run a quick holdout check against positive and negative validation clips
-```
-
-Setup only:
-
-```bash
-python3.10 main.py --setup-only
-```
-
-Run only the training script:
-
-```bash
-.venv/bin/python scripts/train_openwakeword.py --model-name homie --target-phrase "hey homie"
-```
-
-Rebuild feature files:
-
-```bash
-.venv/bin/python scripts/train_openwakeword.py --overwrite-features
-```
-
-Only export ONNX if the TFLite conversion is being annoying:
-
-```bash
-.venv/bin/python scripts/train_openwakeword.py --no-tflite
-```
-
-Skip the quick exported-model check:
-
-```bash
-.venv/bin/python scripts/train_openwakeword.py --skip-eval
-```
-
-Use a stricter/lower detection threshold for the check:
-
-```bash
-.venv/bin/python scripts/train_openwakeword.py --eval-threshold 0.6
-```
-
-## Raspberry Pi usage
-
-The finished files should be here:
+Main output:
 
 ```text
 models/homie.onnx
-models/homie.tflite
+models/homie.eval.json
 ```
 
-In my own Python code I can load the model like this:
+`homie.onnx` is the model. `homie.eval.json` contains the validation scores.
 
-```python
-from openwakeword.model import Model
+## Folders
 
-model = Model(wakeword_models=["models/homie.tflite"])
-```
-
-The audio stream needs to be 16 kHz, mono, 16-bit PCM.
-
-## Setup notes
-
-`ffmpeg` is needed for converting phone recordings.
-
-Ubuntu:
-
-```bash
-sudo apt update
-sudo apt install ffmpeg python3.10 python3.10-venv
-```
-
-Windows is fine for sorting files and checking the repo, but the full training pipeline is meant for Ubuntu with Python 3.10.
-
-## Public repo / license notes
-
-This repo only tracks the pipeline code. Audio recordings, feature files, training artifacts, and exported models are intentionally ignored:
+Put your own recordings here:
 
 ```text
-mobile_uploads/
+mobile_uploads/customword/positive/      wake word clips
+mobile_uploads/customword/negative/      not-the-wake-word clips
+mobile_uploads/customword/background/    your own room noise clips
+```
+
+Optional public background clips are stored separately:
+
+```text
+mobile_uploads/downloaded_backgrounds/
+```
+
+Generated files are written to:
+
+```text
 data/
 artifacts/
 models/
 ```
 
-This project depends on openWakeWord. The openWakeWord code is Apache-2.0 licensed. The pretrained models shipped by openWakeWord can have different, non-commercial license terms, so check their license notes before using or publishing trained model weights commercially.
+## Install System Tools
 
-Do not publish private voice recordings, background recordings, or generated model files unless you know you have the rights to do that.
+Ubuntu:
+
+```bash
+sudo apt update
+sudo apt install ffmpeg python3-venv
+```
+
+## Download Public Backgrounds
+
+This is optional, but useful for reducing false detections.
+
+```bash
+python3 download_backgrounds.py
+```
+
+This downloads and prepares public background audio from MUSAN, ESC-50, and Google Speech Commands.
+
+## Train
+
+```bash
+python3 main.py
+```
+
+This will:
+
+```text
+1. create/use .venv
+2. install Python packages
+3. convert audio to 16 kHz mono WAV
+4. create simple augmented clips
+5. build openWakeWord features
+6. train the model
+7. export ONNX
+8. save validation results
+```
+
+Setup only:
+
+```bash
+python3 main.py --setup-only
+```
+
+Skip package install:
+
+```bash
+python3 main.py --skip-install
+```
+
+## Settings
+
+Change training settings near the top of:
+
+```text
+scripts/train_openwakeword.py
+```
+
+Important settings:
+
+```text
+MODEL_NAME
+TARGET_PHRASE
+TRAIN_STEPS
+OVERWRITE_FEATURES
+RUN_EVAL
+```
+
+Change downloaded background usage near the top of:
+
+```text
+scripts/convert_and_cut_mobile_rec.py
+```
+
+Important settings:
+
+```text
+DEFAULT_DOWNLOADED_BACKGROUND_COUNT
+DEFAULT_DOWNLOADED_BACKGROUND_SEED
+```
+
+Use `-1` for `DEFAULT_DOWNLOADED_BACKGROUND_COUNT` to use all downloaded backgrounds.
+
+## Notes
+
+Python 3.12 is supported with ONNX export. TFLite export is disabled by default because the old openWakeWord TFLite stack works best on Python 3.10.
+
+Do not commit private recordings, generated data, or trained models unless you really want to publish them.

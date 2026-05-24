@@ -6,6 +6,7 @@ __pycache__/
 *.env
 
 mobile_uploads/customword/*
+mobile_uploads/downloaded_backgrounds/
 !mobile_uploads/customword/.gitkeep
 !mobile_uploads/customword/positive/
 !mobile_uploads/customword/positive/.gitkeep
@@ -37,3 +38,5 @@ models/
 
 *.log
 .DS_Store
+
+PIPELINE_WORKFLOW.md
